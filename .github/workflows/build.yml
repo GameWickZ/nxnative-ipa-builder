@@ -23,7 +23,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: ${{ inputs.device == 'iPhone 15 Pro/Pro Max or newer (standard)' && 'xcode-27' || 'macos-latest' }}
     timeout-minutes: 360
 
     steps:
@@ -46,29 +46,33 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Select newest Xcode
+      - name: Select Xcode 27.2 and Metal Toolchain
         shell: bash
         run: |
           set -euo pipefail
           echo "=== Available Xcode versions ==="
           ls -d /Applications/Xcode*.app
 
-          NEWEST_XCODE="$(python - <<'PY'
-          import glob, re
-          paths = [p for p in glob.glob("/Applications/Xcode*.app") if re.search(r"\d+", p)]
-          def ver_key(p):
-              nums = [int(x) for x in re.findall(r"\d+", p)]
-              return (nums, "beta" not in p.lower(), p)
-          if paths:
-              print(sorted(paths, key=ver_key)[-1])
-          PY
-          )"
+          TARGET_XCODE=""
+          for candidate in /Applications/Xcode_27.2.app /Applications/Xcode_27.2.0.app /Applications/Xcode_27.2*.app; do
+            if [[ -d "$candidate" ]]; then
+              TARGET_XCODE="$candidate"
+              break
+            fi
+          done
 
-          if [[ -n "$NEWEST_XCODE" ]]; then
-            echo "Selecting: $NEWEST_XCODE"
-            sudo xcode-select -s "$NEWEST_XCODE/Contents/Developer"
+          if [[ -n "$TARGET_XCODE" ]]; then
+            echo "Selecting: $TARGET_XCODE"
+            sudo xcode-select -s "$TARGET_XCODE/Contents/Developer"
           fi
+
           xcodebuild -version
+
+          if ! xcrun -sdk iphoneos metal --version >/dev/null 2>&1; then
+            echo "Metal toolchain missing; downloading..."
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+          xcrun -sdk iphoneos metal --version
 
       - name: Set up .NET SDK
         uses: actions/setup-dotnet@v4
