@@ -46,6 +46,30 @@ jobs:
         with:
           python-version: "3.13"
 
+      - name: Select newest Xcode
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "=== Available Xcode versions ==="
+          ls -d /Applications/Xcode*.app
+
+          NEWEST_XCODE="$(python - <<'PY'
+          import glob, re
+          paths = [p for p in glob.glob("/Applications/Xcode*.app") if re.search(r"\d+", p)]
+          def ver_key(p):
+              nums = [int(x) for x in re.findall(r"\d+", p)]
+              return (nums, "beta" not in p.lower(), p)
+          if paths:
+              print(sorted(paths, key=ver_key)[-1])
+          PY
+          )"
+
+          if [[ -n "$NEWEST_XCODE" ]]; then
+            echo "Selecting: $NEWEST_XCODE"
+            sudo xcode-select -s "$NEWEST_XCODE/Contents/Developer"
+          fi
+          xcodebuild -version
+
       - name: Set up .NET SDK
         uses: actions/setup-dotnet@v4
         with:
