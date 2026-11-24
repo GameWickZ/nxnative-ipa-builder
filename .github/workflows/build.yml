@@ -1,4 +1,3 @@
-
 name: NxNative - Generic IPA Builder
 
 on:
@@ -100,17 +99,28 @@ jobs:
           WORK="$RUNNER_TEMP/nxnative"
           mkdir -p "$WORK"
 
-          download_file() {
-            local url="$1"
-            local output="$2"
-            local file_id
+          download_target() {
+            local raw_urls="$1"
+            local dest_dir="$2"
 
-            if [[ -z "${url:-}" ]]; then
+            if [[ -z "${raw_urls:-}" ]]; then
               echo "::error::A required download URL is empty."
               exit 1
             fi
 
-            file_id="$(python - "$url" <<'PY'
+            mkdir -p "$dest_dir"
+
+            while IFS= read -r line; do
+              line="${line#"${line%%[![:space:]]*}"}"
+              line="${line%"${line##*[![:space:]]}"}"
+              [[ -z "$line" ]] && continue
+
+              if [[ "$line" == *"/folders/"* ]]; then
+                echo "Downloading Google Drive folder into $(basename "$dest_dir")..."
+                gdown --folder "$line" -O "$dest_dir"
+              else
+                local file_id
+                file_id="$(python - "$line" <<'PY'
           import re
           import sys
           from urllib.parse import urlparse, parse_qs
@@ -137,42 +147,45 @@ jobs:
 
           if not file_id:
               raise SystemExit(
-                  "Could not extract a Google Drive file ID."
+                  f"Could not extract a Google Drive file ID from: {url}"
               )
 
           print(file_id)
           PY
           )"
+                echo "Downloading file ID $file_id into $(basename "$dest_dir")..."
+                (cd "$dest_dir" && gdown "$file_id")
+              fi
+            done <<< "$(printf '%s\n' "$raw_urls" | tr ', \t\r' '\n')"
 
-            echo "Downloading $(basename "$output")..."
-            gdown "$file_id" -O "$output"
-
-            if [[ ! -s "$output" ]]; then
-              echo "::error::Downloaded file is empty."
+            if [[ -z "$(find "$dest_dir" -type f -size +0c -print -quit)" ]]; then
+              echo "::error::No downloaded files found in $dest_dir."
               exit 1
             fi
 
-            file "$output"
+            ls -lh "$dest_dir"
           }
 
-          download_file "$GAME_URL" "$WORK/game.download"
-          download_file "$KEYS_URL" "$WORK/prod.keys"
+          download_target "$GAME_URL" "$WORK/dl-game"
+          download_target "$KEYS_URL" "$WORK/dl-keys"
+
+          KEYS_FILE="$(find "$WORK/dl-keys" -type f -size +0c -print -quit)"
+          cp "$KEYS_FILE" "$WORK/prod.keys"
+          chmod 600 "$WORK/prod.keys"
 
           if [[ -n "${UPDATE_URL:-}" ]]; then
-            download_file "$UPDATE_URL" "$WORK/update.download"
+            download_target "$UPDATE_URL" "$WORK/dl-update"
           else
             echo "No UPDATE_URL configured; continuing without an update."
           fi
 
           if [[ -n "${DLC_URL:-}" ]]; then
-            download_file "$DLC_URL" "$WORK/dlc.download"
+            download_target "$DLC_URL" "$WORK/dl-dlc"
           else
             echo "No DLC_URL configured; continuing without DLC."
           fi
 
-          chmod 600 "$WORK/prod.keys"
-
-      - name: Extract RAR archives or accept direct game packages
+      - name: Extract archives or accept direct game packages
         shell: bash
         run: |
           set -euo pipefail
@@ -181,6 +194,7 @@ jobs:
           mkdir -p "$GAME_DIR"
 
           python - "$WORK" "$GAME_DIR" <<'PY'
+          import re
           import shutil
           import subprocess
           import sys
@@ -188,122 +202,239 @@ jobs:
 
           work = Path(sys.argv[1])
           game_dir = Path(sys.argv[2])
-          package_extensions = {
-              ".nsp", ".xci", ".nsz", ".xcz"
-          }
-          rar_signatures = (
-              b"Rar!\x1a\x07\x00",
-              b"Rar!\x1a\x07\x01\x00",
+          package_extensions = {".nsp", ".xci", ".nsz", ".xcz"}
+          archive_extensions = {".rar", ".zip", ".7z"}
+          rar_part_re = re.compile(
+              r"(?:[\._\-\s\(]|^)part[\s._-]*0*(\d+)\)?\.rar$",
+              re.IGNORECASE,
           )
 
-          def validate_package(path):
+          def detect_magic(path):
               with path.open("rb") as f:
-                  magic = f.read(4)
+                  head = f.read(0x104)
+              if head[:4] == b"PFS0":
+                  return "nsp"
+              if head[:4] == b"HEAD" or head[0x100:0x104] == b"HEAD":
+                  return "xci"
+              if head.startswith((b"Rar!\x1a\x07\x00", b"Rar!\x1a\x07\x01\x00")):
+                  return "rar"
+              if head[:4] == b"PK\x03\x04":
+                  return "zip"
+              if head[:6] == b"7z\xbc\xaf\x27\x1c":
+                  return "7z"
+              return None
 
+          def validate_package(path):
+              kind = detect_magic(path)
               suffix = path.suffix.lower()
-
-              if suffix in (".nsp", ".nsz") and magic != b"PFS0":
+              if suffix in (".nsp", ".nsz") and kind != "nsp":
                   raise SystemExit(
                       f"Invalid {suffix} package signature: {path.name}"
                   )
-
-              if suffix in (".xci", ".xcz") and magic != b"HEAD":
+              if suffix in (".xci", ".xcz") and kind != "xci":
                   raise SystemExit(
                       f"Invalid {suffix} package signature: {path.name}"
                   )
 
           def add_package(source, label):
               target = game_dir / source.name
-
+              if target.exists():
+                  target = game_dir / f"{label}_{source.name}"
               if target.exists():
                   raise SystemExit(
                       "Duplicate package filename: " + source.name
                   )
-
               validate_package(source)
               shutil.copy2(source, target)
-
               print(
                   f"Added {label}: {target.name} "
                   f"({target.stat().st_size:,} bytes)"
               )
 
-          def process_download(label):
-              source = work / f"{label}.download"
+          def extract_with_unar(archive_path, extract_dir, label):
+              extract_dir.mkdir(parents=True, exist_ok=True)
+              print(f"{label}: extracting {archive_path.name} with unar...")
+              subprocess.run(
+                  [
+                      "unar",
+                      "-f",
+                      "-o",
+                      str(extract_dir),
+                      str(archive_path),
+                  ],
+                  check=True,
+              )
+              packages = sorted(
+                  p for p in extract_dir.rglob("*")
+                  if p.is_file()
+                  and not p.name.startswith(".")
+                  and "__MACOSX" not in p.parts
+                  and p.suffix.lower() in package_extensions
+              )
+              if not packages:
+                  raise SystemExit(
+                      f"No NSP/XCI/NSZ/XCZ packages found "
+                      f"after extracting {archive_path.name}."
+                  )
+              for pkg in packages:
+                  add_package(pkg, label)
 
-              if not source.exists():
+          def process_download(label):
+              src_dir = work / f"dl-{label}"
+              if not src_dir.exists():
                   print(f"No {label} download; skipping.")
                   return
 
-              with source.open("rb") as f:
-                  signature = f.read(8)
-
-              is_rar = any(
-                  signature.startswith(magic)
-                  for magic in rar_signatures
+              files = sorted(
+                  p for p in src_dir.rglob("*")
+                  if p.is_file()
+                  and not p.name.startswith(".")
+                  and "__MACOSX" not in p.parts
               )
+              if not files:
+                  print(f"No {label} files found; skipping.")
+                  return
 
-              if is_rar:
-                  extract_dir = work / f"extracted-{label}"
-                  extract_dir.mkdir(parents=True, exist_ok=True)
+              print(f"\n=== Processing {label} ({len(files)} file(s)) ===")
+              for f in files:
+                  print(f"  - {f.name} ({f.stat().st_size:,} bytes)")
 
-                  print(f"{label}: RAR archive detected; extracting.")
+              consumed = set()
+              handled = False
 
-                  subprocess.run(
-                      [
-                          "unar",
-                          "-o",
-                          str(extract_dir),
-                          str(source),
-                      ],
-                      check=True,
+              # 1) Multi-part RAR (*.part1.rar, *.part01.rar, *_part1.rar)
+              part1_rars = []
+              for f in files:
+                  m = rar_part_re.search(f.name)
+                  if m:
+                      if int(m.group(1)) == 1:
+                          part1_rars.append(f)
+                      consumed.add(f)
+
+              for idx, p1 in enumerate(part1_rars):
+                  extract_with_unar(
+                      p1, work / f"extracted-{label}-part-{idx}", label
                   )
+                  handled = True
 
-                  packages = sorted(
-                      p for p in extract_dir.rglob("*")
-                      if p.is_file()
-                      and p.suffix.lower() in package_extensions
-                  )
-
-                  if not packages:
-                      raise SystemExit(
-                          f"No NSP/XCI/NSZ/XCZ packages found "
-                          f"in the {label} RAR archive."
+              # 2) Byte-split files (*.001/.002 or Switch FAT32 00/01)
+              split_heads = [
+                  f for f in files
+                  if f not in consumed
+                  and (re.search(r"\.001$", f.name) or f.name == "00")
+              ]
+              for idx, first in enumerate(split_heads):
+                  if first.name == "00":
+                      parts = sorted(
+                          (
+                              f for f in files
+                              if f not in consumed
+                              and f.parent == first.parent
+                              and re.fullmatch(r"\d{2}", f.name)
+                          ),
+                          key=lambda p: int(p.name),
                       )
-
-                  for package in packages:
-                      add_package(package, label)
-
-              else:
-                  print(
-                      f"{label}: not a RAR archive; "
-                      "checking as a direct package."
-                  )
-
-                  if signature[:4] == b"PFS0":
-                      extension = ".nsp"
-                  elif signature[:4] == b"HEAD":
-                      extension = ".xci"
+                      base_name = f"{label}.nsp"
                   else:
-                      raise SystemExit(
-                          f"{label} is not a recognized RAR archive "
-                          "or direct NSP/XCI package. "
-                          "Direct downloads must be NSP or XCI files."
+                      base_prefix = re.sub(r"\.001$", "", first.name)
+                      parts = sorted(
+                          (
+                              f for f in files
+                              if f not in consumed
+                              and f.parent == first.parent
+                              and f.name.startswith(base_prefix + ".")
+                              and re.fullmatch(r"\d+", f.suffix.lstrip("."))
+                          ),
+                          key=lambda p: int(p.suffix.lstrip(".")),
                       )
+                      base_name = base_prefix
 
-                  target = game_dir / f"{label}{extension}"
+                  for p in parts:
+                      consumed.add(p)
 
-                  if target.exists():
-                      raise SystemExit(
-                          f"Output package already exists: {target.name}"
-                      )
-
-                  shutil.copy2(source, target)
-                  validate_package(target)
-
+                  merged = work / f"merged-{label}-{idx}-{base_name}"
                   print(
-                      f"Added direct package: {target.name} "
-                      f"({target.stat().st_size:,} bytes)"
+                      f"{label}: merging {len(parts)} split parts "
+                      f"into {merged.name}..."
+                  )
+                  with merged.open("wb") as out:
+                      for part in parts:
+                          with part.open("rb") as inp:
+                              shutil.copyfileobj(
+                                  inp, out, length=1024 * 1024 * 8
+                              )
+
+                  kind = detect_magic(merged)
+                  if kind == "nsp":
+                      target = (
+                          merged
+                          if merged.suffix.lower() in (".nsp", ".nsz")
+                          else merged.with_suffix(".nsp")
+                      )
+                      if target != merged:
+                          merged.rename(target)
+                      add_package(target, label)
+                  elif kind == "xci":
+                      target = (
+                          merged
+                          if merged.suffix.lower() in (".xci", ".xcz")
+                          else merged.with_suffix(".xci")
+                      )
+                      if target != merged:
+                          merged.rename(target)
+                      add_package(target, label)
+                  else:
+                      extract_with_unar(
+                          merged,
+                          work / f"extracted-{label}-merged-{idx}",
+                          label,
+                      )
+                  handled = True
+
+              # 3) Standard archives (.rar including .r00 sets, .zip/.z01, .7z)
+              for idx, f in enumerate(files):
+                  if f in consumed:
+                      continue
+                  if re.fullmatch(r"\.[rz]\d{2,}", f.suffix.lower()):
+                      consumed.add(f)
+                      continue
+                  kind = detect_magic(f)
+                  if (
+                      f.suffix.lower() in archive_extensions
+                      or kind in ("rar", "zip", "7z")
+                  ):
+                      consumed.add(f)
+                      extract_with_unar(
+                          f, work / f"extracted-{label}-arc-{idx}", label
+                      )
+                      handled = True
+
+              # 4) Direct packages (.nsp, .xci, .nsz, .xcz)
+              for f in files:
+                  if f in consumed:
+                      continue
+                  kind = detect_magic(f)
+                  if f.suffix.lower() in package_extensions:
+                      add_package(f, label)
+                      consumed.add(f)
+                      handled = True
+                  elif kind == "nsp":
+                      renamed = f.with_name(f"{label}.nsp")
+                      f.rename(renamed)
+                      add_package(renamed, label)
+                      consumed.add(f)
+                      handled = True
+                  elif kind == "xci":
+                      renamed = f.with_name(f"{label}.xci")
+                      f.rename(renamed)
+                      add_package(renamed, label)
+                      consumed.add(f)
+                      handled = True
+
+              if not handled:
+                  raise SystemExit(
+                      f"Unsupported file format in {label}: "
+                      f"{[f.name for f in files]}"
                   )
 
           process_download("game")
@@ -481,11 +612,18 @@ jobs:
           GAME_DIR="$RUNNER_TEMP/GameFiles"
           OUTPUT="$RUNNER_TEMP/NxNative.ipa"
 
-          python scripts/build_ipa_from_nsp.py \
-            "$GAME_DIR" \
-            -k "$WORK/prod.keys" \
-            -o "$OUTPUT" \
-            --allow-other-metal
+          if grep -q -- "--allow-other-metal" scripts/build_ipa_from_nsp.py; then
+            python scripts/build_ipa_from_nsp.py \
+              "$GAME_DIR" \
+              -k "$WORK/prod.keys" \
+              -o "$OUTPUT" \
+              --allow-other-metal
+          else
+            python scripts/build_ipa_from_nsp.py \
+              "$GAME_DIR" \
+              -k "$WORK/prod.keys" \
+              -o "$OUTPUT"
+          fi
 
           if [[ ! -s "$OUTPUT" ]]; then
             echo "::error::IPA build did not produce an output file."
@@ -494,7 +632,6 @@ jobs:
 
           echo "IPA successfully created: $OUTPUT"
           ls -lh "$OUTPUT"
-
 
       - name: Upload IPA
         if: success()
